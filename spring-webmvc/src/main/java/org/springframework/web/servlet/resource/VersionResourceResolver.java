@@ -19,8 +19,10 @@ package org.springframework.web.servlet.resource;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
 import java.net.URI;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.nio.channels.ReadableByteChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -37,6 +39,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.lang.Nullable;
 import org.springframework.util.AntPathMatcher;
 import org.springframework.util.Assert;
+import org.springframework.util.ResourceUtils;
 import org.springframework.util.StringUtils;
 
 /**
@@ -175,6 +178,12 @@ public class VersionResourceResolver extends AbstractResourceResolver {
 		}
 
 		String simplePath = versionStrategy.removeVersion(requestPath, candidateVersion);
+		if (shouldIgnoreInputPath(simplePath)) {
+			if (logger.isTraceEnabled()) {
+				logger.trace("Ignoring invalid path after version removal for \"" + requestPath + "\"");
+			}
+			return null;
+		}
 		Resource baseResource = chain.resolveResource(request, simplePath, locations);
 		if (baseResource == null) {
 			return null;
@@ -230,6 +239,61 @@ public class VersionResourceResolver extends AbstractResourceResolver {
 			return this.versionStrategyMap.get(matchingPatterns.get(0));
 		}
 		return null;
+	}
+
+	/**
+	 * Whether the given path, obtained by removing the version from a request
+	 * path, must not be passed on to the rest of the resolver chain.
+	 * <p>The version substring is removed from a path that has already cleared
+	 * {@link ResourceHttpRequestHandler#isInvalidPath}, so the removal itself is
+	 * the only step that can turn an accepted path into an escaping one. Rejects
+	 * an empty result along with the same constructs
+	 * {@code ResourceHttpRequestHandler} rejects up front.
+	 */
+	private static boolean shouldIgnoreInputPath(String path) {
+		if (!StringUtils.hasText(path)) {
+			return true;
+		}
+		return (isInvalidPath(path) || isInvalidEncodedPath(path));
+	}
+
+	private static boolean isInvalidPath(String path) {
+		if (path.contains("WEB-INF") || path.contains("META-INF")) {
+			return true;
+		}
+		if (path.contains(":/")) {
+			String relativePath = (path.charAt(0) == '/' ? path.substring(1) : path);
+			if (ResourceUtils.isUrl(relativePath) || relativePath.startsWith("url:")) {
+				return true;
+			}
+		}
+		return (path.contains("../") ||
+				(path.contains("..") && StringUtils.cleanPath(path).contains("../")));
+	}
+
+	/**
+	 * Whether the given path, once decoded (up to twice, as the resource handler
+	 * does when normalizing the input path), is rejected by {@link #isInvalidPath}.
+	 */
+	private static boolean isInvalidEncodedPath(String path) {
+		String decodedPath = path;
+		try {
+			for (int i = 0; i < 2 && decodedPath.contains("%"); i++) {
+				// Use URLDecoder (vs UriUtils) to preserve potentially decoded UTF-8 chars
+				decodedPath = URLDecoder.decode(decodedPath, "UTF-8");
+				decodedPath = StringUtils.replace(decodedPath, "\\", "/");
+				if (!StringUtils.hasText(decodedPath) || isInvalidPath(decodedPath)) {
+					return true;
+				}
+			}
+		}
+		catch (IllegalArgumentException ex) {
+			// May not be possible to decode...
+		}
+		catch (UnsupportedEncodingException ex) {
+			// Should never happen...
+		}
+		return false;
 	}
 
 

@@ -41,6 +41,7 @@ import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.util.DigestUtils;
 import org.springframework.util.StringUtils;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.accept.ContentNegotiationManager;
@@ -443,6 +444,39 @@ public class ResourceHttpRequestHandlerTests {
 		// Dot segments are normalized against the location, not through the symbolic link
 		testResolvePath(handler, "link/../file.txt", false, HttpStatus.OK);
 		testResolvePath(handler, "link/%2e%2e/file.txt", true, HttpStatus.OK);
+	}
+
+	@Test  // gh-36698
+	public void resolveVersionedPathWithTraversalAfterVersionRemoved(@TempDir Path tempDir) throws Exception {
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		byte[] file = "file".getBytes(StandardCharsets.UTF_8);
+		byte[] secret = "secret".getBytes(StandardCharsets.UTF_8);
+		Files.write(location.resolve("file.txt"), file);
+		Files.write(tempDir.resolve("secret.txt"), secret);
+		Files.write(tempDir.resolve("secret"), secret);
+		String fileHash = DigestUtils.md5DigestAsHex(file);
+		String secretHash = DigestUtils.md5DigestAsHex(secret);
+
+		VersionResourceResolver versionResolver = new VersionResourceResolver();
+		versionResolver.addContentVersionStrategy("/**");
+
+		ResourceHttpRequestHandler handler = new ResourceHttpRequestHandler();
+		handler.setResourceResolvers(Arrays.asList(versionResolver, new PathResourceResolver()));
+		handler.setLocations(Collections.singletonList(new FileSystemResource(location.toString() + "/")));
+		handler.setServletContext(new TestServletContext());
+		handler.afterPropertiesSet();
+
+		// Sanity check: versioned resources within the location are served
+		testResolvePath(handler, "file-" + fileHash + ".txt", false, HttpStatus.OK);
+		testResolvePath(handler, "file-" + fileHash + ".txt", true, HttpStatus.OK);
+
+		// Removing every occurrence of the version would yield "../secret.txt"
+		testResolvePath(handler, "..-" + secretHash + "/secret-" + secretHash + ".txt", false, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "..-" + secretHash + "/secret-" + secretHash + ".txt", true, HttpStatus.NOT_FOUND);
+
+		// Removing the version leaves "%2e./secret", which is decoded to "../secret"
+		testResolvePath(handler, "%2e-" + secretHash + "./secret", true, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "%2E-" + secretHash + "./secret", true, HttpStatus.NOT_FOUND);
 	}
 
 	private ResourceHttpRequestHandler initSymlinkHandler(Path tempDir) throws Exception {

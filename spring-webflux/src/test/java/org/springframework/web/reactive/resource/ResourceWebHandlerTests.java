@@ -49,6 +49,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.server.PathContainer;
+import org.springframework.util.DigestUtils;
 import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.HandlerMapping;
 import org.springframework.web.server.MethodNotAllowedException;
@@ -386,6 +387,36 @@ public class ResourceWebHandlerTests {
 		// Dot segments are normalized against the location, not through the symbolic link
 		testValidPath("link/../file.txt", handler);
 		testValidPath("link/%2e%2e/file.txt", handler);
+	}
+
+	@Test  // gh-36698
+	public void resolveVersionedPathWithTraversalAfterVersionRemoved(@TempDir Path tempDir) throws Exception {
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		byte[] file = "file".getBytes(UTF_8);
+		byte[] secret = "secret".getBytes(UTF_8);
+		Files.write(location.resolve("file.txt"), file);
+		Files.write(tempDir.resolve("secret.txt"), secret);
+		Files.write(tempDir.resolve("secret"), secret);
+		String fileHash = DigestUtils.md5DigestAsHex(file);
+		String secretHash = DigestUtils.md5DigestAsHex(secret);
+
+		VersionResourceResolver versionResolver = new VersionResourceResolver();
+		versionResolver.addContentVersionStrategy("/**");
+
+		ResourceWebHandler handler = new ResourceWebHandler();
+		handler.setResourceResolvers(Arrays.asList(versionResolver, new PathResourceResolver()));
+		handler.setLocations(Collections.singletonList(new FileSystemResource(location.toString() + "/")));
+		handler.afterPropertiesSet();
+
+		// Sanity check: versioned resources within the location are served
+		testValidPath("file-" + fileHash + ".txt", handler);
+
+		// Removing every occurrence of the version would yield "../secret.txt"
+		testInvalidPath("..-" + secretHash + "/secret-" + secretHash + ".txt", handler);
+
+		// Removing the version leaves "%2e./secret", which is decoded to "../secret"
+		testInvalidPath("%2e-" + secretHash + "./secret", handler);
+		testInvalidPath("%2E-" + secretHash + "./secret", handler);
 	}
 
 	private ResourceWebHandler initSymlinkHandler(Path tempDir) throws Exception {
