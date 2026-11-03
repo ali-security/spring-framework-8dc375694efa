@@ -17,15 +17,28 @@
 package org.springframework.web.servlet.function;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Optional;
 import java.util.function.Function;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.DefaultResourceLoader;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
+import org.springframework.web.context.support.ServletContextResource;
 import org.springframework.web.servlet.handler.PathPatternsTestUtils;
+import org.springframework.web.testfixture.servlet.MockServletContext;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -33,6 +46,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * @author Arjen Poutsma
  */
 class PathResourceLookupFunctionTests {
+
+	@TempDir
+	Path tempDir;
 
 	@Test
 	void normal() throws Exception {
@@ -94,6 +110,128 @@ class PathResourceLookupFunctionTests {
 		assertThat(result.isPresent()).isTrue();
 
 		assertThat(result.get().getFile()).isEqualTo(defaultResource.getFile());
+	}
+
+	@Test
+	void fileSystemResourceLocation() throws Exception {
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/sub/file.txt"));
+		assertThat(result).isPresent();
+		assertThat(result.get().getFile()).isEqualTo(this.tempDir.resolve("static/sub/file.txt").toFile());
+	}
+
+	@Test
+	void fileSystemResourceLocationWithEncodedFilename() throws Exception {
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/a%20b.txt"));
+		assertThat(result).isPresent();
+		assertThat(result.get().getFile()).isEqualTo(this.tempDir.resolve("static/a b.txt").toFile());
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"sub%2f%2f..%2f..%2fsecret.txt",
+			"sub%2F%2F..%2F..%2Fsecret.txt",
+			"sub/%2f..%2f..%2fsecret.txt",
+			"sub/%2f%2e%2e%2f%2e%2e%2fsecret.txt",
+			"sub%2f%2f%2f..%2f..%2fsecret.txt",
+			"..%2fsecret.txt",
+			"%2e%2e/secret.txt",
+			"%2e%2e%2fsecret.txt",
+			"%2E%2E%2Fsecret.txt",
+			"%2e%2e%5csecret.txt",
+			"%5C%5C..%5C..%5Csecret.txt",
+			"sub/..%2f..%2fsecret.txt",
+			"sub/%2e%2e/%2e%2e/secret.txt",
+			"%252e%252e%252fsecret.txt",
+			"..%255csecret.txt"
+	})
+	void fileSystemResourceLocationWithTraversal(String path) throws Exception {
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/" + path));
+		assertThat(result).isNotPresent();
+	}
+
+	@Test
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Backslash is not allowed in a file name")
+	void fileSystemResourceLocationWithEncodedBackslashTraversal() throws Exception {
+		// On Windows "..\" is a parent directory reference. Here the file name
+		// literally contains it, so that only the under-location check can reject it.
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+		writeFile(this.tempDir.resolve("static/sub/..\\secret.txt"), "secret");
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/sub/..%5Csecret.txt"));
+		assertThat(result).isNotPresent();
+	}
+
+	@Test
+	void servletContextResourceLocation() throws Exception {
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initServletContextLocation());
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/sub/file.txt"));
+		assertThat(result).isPresent();
+		assertThat(result.get()).isInstanceOf(ServletContextResource.class);
+		assertThat(((ServletContextResource) result.get()).getPath()).isEqualTo("/static/sub/file.txt");
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"sub%2f%2f..%2f..%2fsecret.txt",
+			"sub/%2f..%2f..%2fsecret.txt",
+			"..%2fsecret.txt",
+			"%2e%2e%2fsecret.txt",
+			"%2e%2e%5csecret.txt",
+			"%252e%252e%252fsecret.txt",
+			"sub/%252e%252e%252f%252e%252e%252fsecret.txt"
+	})
+	void servletContextResourceLocationWithTraversal(String path) throws Exception {
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initServletContextLocation());
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/" + path));
+		assertThat(result).isNotPresent();
+	}
+
+	@Test
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Backslash is not allowed in a file name")
+	void servletContextResourceLocationWithEncodedBackslashTraversal() throws Exception {
+		// On Windows "..\" is a parent directory reference. Here the file name
+		// literally contains it, so that only the under-location check can reject it.
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initServletContextLocation());
+		writeFile(this.tempDir.resolve("static/sub/..\\secret.txt"), "secret");
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/sub/..%255Csecret.txt"));
+		assertThat(result).isNotPresent();
+	}
+
+	private Resource initFileSystemLocation() throws IOException {
+		Path location = initFiles();
+		return new FileSystemResource(location.toString() + "/");
+	}
+
+	private Resource initServletContextLocation() throws IOException {
+		initFiles();
+		String basePath = this.tempDir.toUri().toString();
+		if (basePath.endsWith("/")) {
+			basePath = basePath.substring(0, basePath.length() - 1);
+		}
+		MockServletContext servletContext = new MockServletContext(basePath, new DefaultResourceLoader());
+		return new ServletContextResource(servletContext, "/static/");
+	}
+
+	private Path initFiles() throws IOException {
+		Path location = Files.createDirectories(this.tempDir.resolve("static"));
+		Files.createDirectories(location.resolve("sub"));
+		writeFile(location.resolve("sub/file.txt"), "file");
+		writeFile(location.resolve("a b.txt"), "file");
+		writeFile(this.tempDir.resolve("secret.txt"), "secret");
+		return location;
+	}
+
+	private static void writeFile(Path path, String content) throws IOException {
+		Files.write(path, content.getBytes(StandardCharsets.UTF_8));
 	}
 
 	private ServerRequest initRequest(String httpMethod, String requestUri) {

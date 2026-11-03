@@ -18,15 +18,26 @@ package org.springframework.web.reactive.function.server;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.function.Function;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.testfixture.http.server.reactive.MockServerHttpRequest;
 import org.springframework.web.testfixture.server.MockServerWebExchange;
 
@@ -34,6 +45,9 @@ import org.springframework.web.testfixture.server.MockServerWebExchange;
  * @author Arjen Poutsma
  */
 public class PathResourceLookupFunctionTests {
+
+	@TempDir
+	Path tempDir;
 
 	@Test
 	public void normal() throws Exception {
@@ -122,6 +136,105 @@ public class PathResourceLookupFunctionTests {
 				})
 				.expectComplete()
 				.verify();
+	}
+
+	@Test
+	void fileSystemResourceLocation() throws Exception {
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+		Mono<Resource> result = function.apply(initRequest("/resources/sub/file.txt"));
+
+		File expected = this.tempDir.resolve("static/sub/file.txt").toFile();
+		StepVerifier.create(result)
+				.expectNextMatches(resource -> {
+					try {
+						return expected.equals(resource.getFile());
+					}
+					catch (IOException ex) {
+						return false;
+					}
+				})
+				.expectComplete()
+				.verify();
+	}
+
+	@Test
+	void fileSystemResourceLocationWithEncodedFilename() throws Exception {
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+		Mono<Resource> result = function.apply(initRequest("/resources/a%20b.txt"));
+
+		File expected = this.tempDir.resolve("static/a b.txt").toFile();
+		StepVerifier.create(result)
+				.expectNextMatches(resource -> {
+					try {
+						return expected.equals(resource.getFile());
+					}
+					catch (IOException ex) {
+						return false;
+					}
+				})
+				.expectComplete()
+				.verify();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"sub%2f%2f..%2f..%2fsecret.txt",
+			"sub%2F%2F..%2F..%2Fsecret.txt",
+			"sub/%2f..%2f..%2fsecret.txt",
+			"sub/%2f%2e%2e%2f%2e%2e%2fsecret.txt",
+			"sub%2f%2f%2f..%2f..%2fsecret.txt",
+			"..%2fsecret.txt",
+			"%2e%2e/secret.txt",
+			"%2e%2e%2fsecret.txt",
+			"%2E%2E%2Fsecret.txt",
+			"%2e%2e%5csecret.txt",
+			"%5C%5C..%5C..%5Csecret.txt",
+			"sub/..%2f..%2fsecret.txt",
+			"sub/%2e%2e/%2e%2e/secret.txt",
+			"%252e%252e%252fsecret.txt",
+			"..%255csecret.txt"
+	})
+	void fileSystemResourceLocationWithTraversal(String path) throws Exception {
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+		Mono<Resource> result = function.apply(initRequest("/resources/" + path));
+
+		StepVerifier.create(result)
+				.expectComplete()
+				.verify();
+	}
+
+	@Test
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Backslash is not allowed in a file name")
+	void fileSystemResourceLocationWithEncodedBackslashTraversal() throws Exception {
+		// On Windows "..\" is a parent directory reference. Here the file name
+		// literally contains it, so that only the under-location check can reject it.
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+		writeFile(this.tempDir.resolve("static/sub/..\\secret.txt"), "secret");
+		Mono<Resource> result = function.apply(initRequest("/resources/sub/..%5Csecret.txt"));
+
+		StepVerifier.create(result)
+				.expectComplete()
+				.verify();
+	}
+
+	private Resource initFileSystemLocation() throws IOException {
+		Path location = Files.createDirectories(this.tempDir.resolve("static"));
+		Files.createDirectories(location.resolve("sub"));
+		writeFile(location.resolve("sub/file.txt"), "file");
+		writeFile(location.resolve("a b.txt"), "file");
+		writeFile(this.tempDir.resolve("secret.txt"), "secret");
+		return new FileSystemResource(location.toString() + "/");
+	}
+
+	private static void writeFile(Path path, String content) throws IOException {
+		Files.write(path, content.getBytes(StandardCharsets.UTF_8));
+	}
+
+	private ServerRequest initRequest(String path) {
+		// Use an already encoded URI, as the URI template variant would encode "%" again
+		MockServerHttpRequest mockRequest =
+				MockServerHttpRequest.method(HttpMethod.GET, URI.create("https://localhost" + path)).build();
+		return new DefaultServerRequest(MockServerWebExchange.from(mockRequest), Collections.emptyList());
 	}
 
 }
