@@ -41,6 +41,8 @@ import org.springframework.http.HttpMethod;
 import org.springframework.web.testfixture.http.server.reactive.MockServerHttpRequest;
 import org.springframework.web.testfixture.server.MockServerWebExchange;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
 /**
  * @author Arjen Poutsma
  */
@@ -215,6 +217,64 @@ public class PathResourceLookupFunctionTests {
 		StepVerifier.create(result)
 				.expectComplete()
 				.verify();
+	}
+
+	@ParameterizedTest  // CVE-2024-38819
+	@ValueSource(strings = {
+			"link/../secret.txt",
+			"link//../secret.txt",
+			"link/%2e%2e/secret.txt",
+			"link/%2E%2E/secret.txt",
+			"link/..%2fsecret.txt",
+			"link%2f..%2fsecret.txt",
+			"link%2f%2e%2e%2fsecret.txt",
+			"link/%252e%252e/secret.txt",
+			"link/%252e%252e%252fsecret.txt",
+			"link%252f%252e%252e%252fsecret.txt"
+	})
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Creating a symbolic link requires elevated privileges")
+	void fileSystemResourceLocationWithSymlinkTraversal(String path) throws Exception {
+		// "static/link" points to a directory outside of the location, so resolving
+		// "link/../secret.txt" through the file system escapes the location
+		Resource location = initFileSystemLocation();
+		initSymbolicLink();
+
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+		Mono<Resource> result = function.apply(initRequest("/resources/" + path));
+
+		StepVerifier.create(result)
+				.expectComplete()
+				.verify();
+	}
+
+	@Test  // CVE-2024-38819
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Creating a symbolic link requires elevated privileges")
+	void fileSystemResourceLocationWithDotSegmentsWithinLocation() throws Exception {
+		Resource location = initFileSystemLocation();
+		initSymbolicLink();
+
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+		Mono<Resource> result = function.apply(initRequest("/resources/link/%2e%2e/sub/file.txt"));
+
+		File expected = this.tempDir.resolve("static/sub/file.txt").toFile();
+		StepVerifier.create(result)
+				.expectNextMatches(resource -> {
+					try {
+						return expected.equals(resource.getFile());
+					}
+					catch (IOException ex) {
+						return false;
+					}
+				})
+				.expectComplete()
+				.verify();
+	}
+
+	private void initSymbolicLink() throws IOException {
+		Path outside = Files.createDirectories(this.tempDir.resolve("outside/nested"));
+		writeFile(this.tempDir.resolve("outside/secret.txt"), "secret");
+		Path link = Files.createSymbolicLink(this.tempDir.resolve("static/link"), outside);
+		assertThat(link.resolve("../secret.txt")).as("Traversal through the symbolic link").exists();
 	}
 
 	private Resource initFileSystemLocation() throws IOException {

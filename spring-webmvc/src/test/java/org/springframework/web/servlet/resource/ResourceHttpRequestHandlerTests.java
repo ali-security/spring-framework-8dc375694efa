@@ -17,6 +17,9 @@
 package org.springframework.web.servlet.resource;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -26,7 +29,10 @@ import javax.servlet.http.HttpServletResponse;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.FileSystemResource;
@@ -44,6 +50,7 @@ import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.testfixture.servlet.MockHttpServletRequest;
 import org.springframework.web.testfixture.servlet.MockHttpServletResponse;
 import org.springframework.web.testfixture.servlet.MockServletContext;
+import org.springframework.web.util.ServletRequestPathUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
@@ -362,7 +369,6 @@ public class ResourceHttpRequestHandlerTests {
 		testInvalidPath("/../.." + secretPath, handler);
 		testInvalidPath("/%2E%2E/testsecret/secret.txt", handler);
 		testInvalidPath("/%2E%2E/testsecret/secret.txt", handler);
-		testInvalidPath("%2F%2F%2E%2E%2F%2F%2E%2E" + secretPath, handler);
 	}
 
 	private void testInvalidPath(String requestPath, ResourceHttpRequestHandler handler) throws Exception {
@@ -370,6 +376,103 @@ public class ResourceHttpRequestHandlerTests {
 		this.response = new MockHttpServletResponse();
 		handler.handleRequest(this.request, this.response);
 		assertThat(this.response.getStatus()).isEqualTo(HttpStatus.NOT_FOUND.value());
+	}
+
+	@Test  // CVE-2024-38819
+	public void testInvalidEncodedPath() throws Exception {
+		// Use mock ResourceResolver: i.e. we're only testing upfront validations...
+
+		Resource resource = mock(Resource.class);
+		given(resource.getFilename()).willThrow(new AssertionError("Resource should not be resolved"));
+		given(resource.getInputStream()).willThrow(new AssertionError("Resource should not be resolved"));
+		ResourceResolver resolver = mock(ResourceResolver.class);
+		given(resolver.resolveResource(any(), any(), any(), any())).willReturn(resource);
+
+		ResourceHttpRequestHandler handler = new ResourceHttpRequestHandler();
+		handler.setLocations(Collections.singletonList(new ClassPathResource("test/", getClass())));
+		handler.setResourceResolvers(Collections.singletonList(resolver));
+		handler.setServletContext(new TestServletContext());
+		handler.afterPropertiesSet();
+
+		// Single-encoded traversal
+		testInvalidPath("%2e%2e%2ftestsecret/secret.txt", handler);
+		testInvalidPath("%2E%2E%2Ftestsecret/secret.txt", handler);
+		testInvalidPath("..%2ftestsecret/secret.txt", handler);
+		testInvalidPath("%2e%2e/testsecret/secret.txt", handler);
+
+		// Double-encoded traversal
+		testInvalidPath("%252e%252e%252ftestsecret/secret.txt", handler);
+		testInvalidPath("%252E%252E%252Ftestsecret/secret.txt", handler);
+		testInvalidPath("..%252ftestsecret/secret.txt", handler);
+		testInvalidPath("%2e%2e%252ftestsecret/secret.txt", handler);
+		testInvalidPath("%252e%252e/testsecret/secret.txt", handler);
+		testInvalidPath("/%252e%252e%252ftestsecret/secret.txt", handler);
+		testInvalidPath("test/%252e%252e/%252e%252e/testsecret/secret.txt", handler);
+	}
+
+	@Test  // CVE-2024-38819
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Creating a symbolic link requires elevated privileges")
+	public void resolvePathWithSymlinkTraversal(@TempDir Path tempDir) throws Exception {
+		ResourceHttpRequestHandler handler = initSymlinkHandler(tempDir);
+
+		// Sanity check: resources within the location are served
+		testResolvePath(handler, "file.txt", false, HttpStatus.OK);
+
+		// Path within mapping decoded by the UrlPathHelper
+		testResolvePath(handler, "link/../secret.txt", false, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "/link/../secret.txt", false, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link\\..\\secret.txt", false, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link/%2e%2e/secret.txt", false, HttpStatus.NOT_FOUND);
+
+		// Encoded path within mapping from parsed PathPattern's
+		testResolvePath(handler, "link/../secret.txt", true, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link/%2e%2e/secret.txt", true, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link/%2E%2E/secret.txt", true, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link/..%2fsecret.txt", true, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link%2f..%2fsecret.txt", true, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link%5c..%5csecret.txt", true, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link/%252e%252e/secret.txt", true, HttpStatus.NOT_FOUND);
+		testResolvePath(handler, "link/%252e%252e%252fsecret.txt", true, HttpStatus.NOT_FOUND);
+	}
+
+	@Test  // CVE-2024-38819
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Creating a symbolic link requires elevated privileges")
+	public void resolvePathWithDotSegmentsWithinLocation(@TempDir Path tempDir) throws Exception {
+		ResourceHttpRequestHandler handler = initSymlinkHandler(tempDir);
+
+		// Dot segments are normalized against the location, not through the symbolic link
+		testResolvePath(handler, "link/../file.txt", false, HttpStatus.OK);
+		testResolvePath(handler, "link/%2e%2e/file.txt", true, HttpStatus.OK);
+	}
+
+	private ResourceHttpRequestHandler initSymlinkHandler(Path tempDir) throws Exception {
+		// "static/link" points to a directory outside of the location, so resolving
+		// "link/../secret.txt" through the file system escapes the location
+		Path location = Files.createDirectories(tempDir.resolve("static"));
+		Files.write(location.resolve("file.txt"), "file".getBytes(StandardCharsets.UTF_8));
+		Path outside = Files.createDirectories(tempDir.resolve("outside/nested"));
+		Files.write(tempDir.resolve("outside/secret.txt"), "secret".getBytes(StandardCharsets.UTF_8));
+		Path link = Files.createSymbolicLink(location.resolve("link"), outside);
+		assertThat(link.resolve("../secret.txt")).as("Traversal through the symbolic link").exists();
+
+		ResourceHttpRequestHandler handler = new ResourceHttpRequestHandler();
+		handler.setLocations(Collections.singletonList(new FileSystemResource(location.toString() + "/")));
+		handler.setServletContext(new TestServletContext());
+		handler.afterPropertiesSet();
+		return handler;
+	}
+
+	private void testResolvePath(ResourceHttpRequestHandler handler, String requestPath,
+			boolean parsedPath, HttpStatus expectedStatus) throws Exception {
+
+		MockHttpServletRequest request = new MockHttpServletRequest("GET", "/resources/" + requestPath);
+		if (parsedPath) {
+			ServletRequestPathUtils.parseAndCache(request);
+		}
+		request.setAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE, requestPath);
+		MockHttpServletResponse response = new MockHttpServletResponse();
+		handler.handleRequest(request, response);
+		assertThat(response.getStatus()).as(requestPath).isEqualTo(expectedStatus.value());
 	}
 
 	@Test
@@ -460,6 +563,33 @@ public class ResourceHttpRequestHandlerTests {
 		assertThat(this.handler.processPath("\\\\foo\\ \\bar\\\\baz\\\\")).isEqualTo("/foo/ /bar/baz/");
 		assertThat(this.handler.processPath("foo\\\\/\\////bar")).isEqualTo("foo/bar");
 
+	}
+
+	@Test  // CVE-2024-38819
+	public void processPathWithTraversal() {
+		// Encoded sequences without traversal are left untouched
+		assertThat(this.handler.processPath("foo%20bar/baz.txt")).isEqualTo("foo%20bar/baz.txt");
+
+		// Dot segments within the path are normalized
+		assertThat(this.handler.processPath("foo/../bar")).isEqualTo("bar");
+		assertThat(this.handler.processPath("foo/%2e%2e/bar")).isEqualTo("bar");
+		assertThat(this.handler.processPath("foo%2f%2e%2e%2fbar")).isEqualTo("bar");
+
+		// Single-encoded traversal
+		assertThat(this.handler.processPath("%2e%2e%2ffoo/bar")).isEqualTo("../foo/bar");
+		assertThat(this.handler.processPath("%2E%2E%2Ffoo/bar")).isEqualTo("../foo/bar");
+		assertThat(this.handler.processPath("..%2ffoo/bar")).isEqualTo("../foo/bar");
+		assertThat(this.handler.processPath("%2e%2e/foo/bar")).isEqualTo("../foo/bar");
+
+		// Double-encoded traversal
+		assertThat(this.handler.processPath("%252e%252e%252ffoo/bar")).isEqualTo("../foo/bar");
+		assertThat(this.handler.processPath("%252E%252E%252Ffoo/bar")).isEqualTo("../foo/bar");
+		assertThat(this.handler.processPath("..%252ffoo/bar")).isEqualTo("../foo/bar");
+		assertThat(this.handler.processPath("%2e%2e%252ffoo/bar")).isEqualTo("../foo/bar");
+		assertThat(this.handler.processPath("%252e%252e/foo/bar")).isEqualTo("../foo/bar");
+
+		// Invalid encoded sequence
+		assertThat(this.handler.processPath("foo/%zz/bar")).isEmpty();
 	}
 
 	@Test

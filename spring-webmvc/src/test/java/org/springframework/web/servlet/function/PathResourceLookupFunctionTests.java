@@ -206,6 +206,50 @@ class PathResourceLookupFunctionTests {
 		assertThat(result).isNotPresent();
 	}
 
+	@ParameterizedTest  // CVE-2024-38819
+	@ValueSource(strings = {
+			"link/../secret.txt",
+			"link//../secret.txt",
+			"link/%2e%2e/secret.txt",
+			"link/%2E%2E/secret.txt",
+			"link/..%2fsecret.txt",
+			"link%2f..%2fsecret.txt",
+			"link%2f%2e%2e%2fsecret.txt",
+			"link/%252e%252e/secret.txt",
+			"link/%252e%252e%252fsecret.txt",
+			"link%252f%252e%252e%252fsecret.txt"
+	})
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Creating a symbolic link requires elevated privileges")
+	void fileSystemResourceLocationWithSymlinkTraversal(String path) throws Exception {
+		// "static/link" points to a directory outside of the location, so resolving
+		// "link/../secret.txt" through the file system escapes the location
+		Resource location = initFileSystemLocation();
+		initSymbolicLink();
+
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/" + path));
+		assertThat(result).isNotPresent();
+	}
+
+	@Test  // CVE-2024-38819
+	@DisabledOnOs(value = OS.WINDOWS, disabledReason = "Creating a symbolic link requires elevated privileges")
+	void fileSystemResourceLocationWithDotSegmentsWithinLocation() throws Exception {
+		Resource location = initFileSystemLocation();
+		initSymbolicLink();
+
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/link/%2e%2e/sub/file.txt"));
+		assertThat(result).isPresent();
+		assertThat(result.get().getFile()).isEqualTo(this.tempDir.resolve("static/sub/file.txt").toFile());
+	}
+
+	private void initSymbolicLink() throws IOException {
+		Path outside = Files.createDirectories(this.tempDir.resolve("outside/nested"));
+		writeFile(this.tempDir.resolve("outside/secret.txt"), "secret");
+		Path link = Files.createSymbolicLink(this.tempDir.resolve("static/link"), outside);
+		assertThat(link.resolve("../secret.txt")).as("Traversal through the symbolic link").exists();
+	}
+
 	private Resource initFileSystemLocation() throws IOException {
 		Path location = initFiles();
 		return new FileSystemResource(location.toString() + "/");
