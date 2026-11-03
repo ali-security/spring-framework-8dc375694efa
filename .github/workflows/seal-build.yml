@@ -1,0 +1,286 @@
+# Sealed-build workflow for the Spring Framework 5.3.x monorepo.
+#
+# Upstream 5.3.x builds and tests on Concourse (ci/pipeline.yml, ci/scripts/build-project.sh:
+# `./gradlew --no-daemon --max-workers=4 build` on a JDK 8 image) and ships no GitHub
+# workflow that builds or tests, so this file mirrors that Concourse job:
+#   * `build` assembles the spring-webmvc jar on JDK 8 and uploads it;
+#   * `test` runs every module's `test` task (the test half of upstream's `build`) on JDK 8,
+#     split across legs so each fits the CI time budget.
+name: Seal Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test selector, e.g. ':spring-webmvc:test --tests *FooTests'. Empty runs the full suite."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GRADLE_ARGS: >-
+    --no-daemon --console=plain --stacktrace --no-build-cache --max-workers=4
+    -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false
+    -Dorg.gradle.jvmargs=-Xmx3g
+
+jobs:
+  build:
+    name: Build spring-webmvc jar
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+      - name: Drop Gradle Enterprise plugins (ge.spring.io / repo.spring.io plugin repo unavailable to the fork)
+        run: |
+          sed -i -e '/id "com.gradle.enterprise"/d' -e '/id "io.spring.ge.conventions"/d' \
+                 -e '\#maven { url "https://repo.spring.io/release" }#d' settings.gradle
+          awk 'BEGIN{skip=0;depth=0}
+               /^settings\.gradle\.projectsLoaded/{skip=1}
+               { if (skip) { o=gsub(/\{/,"{"); c=gsub(/\}/,"}"); depth+=o-c; if (depth<=0 && (o+c)>0) skip=0; next } print }' \
+              settings.gradle > settings.gradle.seal && mv settings.gradle.seal settings.gradle
+          grep -q 'rootProject.children.each' settings.gradle
+          if grep -nE 'gradleEnterprise|com.gradle.enterprise|io.spring.ge.conventions' settings.gradle; then exit 1; fi
+      - name: Install test-result reporting init script
+        run: &init_script |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/seal-test-results.gradle <<'EOF'
+          allprojects {
+              tasks.withType(Test).configureEach { t ->
+                  t.outputs.cacheIf { false }
+                  t.outputs.upToDateWhen { false }
+                  t.testLogging {
+                      events "failed"
+                      exceptionFormat "full"
+                  }
+                  def skipFile = t.project.rootProject.file("build/seal-skipped/${t.path.replace(':', '_')}.tsv")
+                  t.doFirst { skipFile.parentFile.mkdirs(); skipFile.text = "" }
+                  t.afterTest { desc, result ->
+                      if (result.resultType == TestResult.ResultType.SKIPPED) {
+                          def msg = result.exception ? result.exception.toString().replaceAll(/[\t\r\n]+/, ' ') : ''
+                          skipFile << "${t.path}\t${desc.className}\t${desc.name}\t${msg}\n"
+                      }
+                  }
+                  t.afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println "TEST SUMMARY ${t.path}: tests=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount} result=${result.resultType}"
+                      }
+                  }
+              }
+          }
+          EOF
+      - name: Build
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $GRADLE_ARGS --continue :spring-webmvc:jar ${{ inputs.test-filter }}
+          else
+            ./gradlew $GRADLE_ARGS :spring-webmvc:jar
+          fi
+      - name: Report skipped tests
+        if: ${{ !cancelled() && inputs.test-filter != '' }}
+        run: &report_skips |
+          cat > "$RUNNER_TEMP/seal_skips.py" <<'EOF'
+          import glob, os, re, sys
+
+          root = os.getcwd()
+          SRC = {}
+          for dirpath, dirs, files in os.walk(root):
+              dirs[:] = [d for d in dirs if d not in ('build', '.git', '.gradle', 'node_modules')]
+              for f in files:
+                  if f.endswith('.java') or f.endswith('.kt'):
+                      p = os.path.join(dirpath, f)
+                      m = re.search(r'/src/[^/]+/(?:java|kotlin)/(.+)\.(?:java|kt)$', p)
+                      if m:
+                          SRC.setdefault(m.group(1).replace('/', '.'), p)
+
+          ANN = re.compile(r'@(?:Disabled\w*|Enabled\w*|Ignore|IfProfileValue)\b(?:\([^)]*\)?)?')
+          ASSUME = re.compile(r'\b(?:assume\w*\s*\(|Assumptions\.\w+|Assume\.\w+|assumingThat\s*\()')
+          CACHE = {}
+
+          def lines_of(path):
+              if path not in CACHE:
+                  with open(path, encoding='utf-8', errors='replace') as fh:
+                      CACHE[path] = fh.read().split('\n')
+              return CACHE[path]
+
+          def resolve(fqcn):
+              """Return (path, simpleName) for a possibly nested binary class name."""
+              name = fqcn.replace('$', '.')
+              parts = name.split('.')
+              for i in range(len(parts), 0, -1):
+                  cand = '.'.join(parts[:i])
+                  if cand in SRC:
+                      return SRC[cand], parts[-1]
+              return None, parts[-1]
+
+          def annotations_above(lines, idx, limit=10):
+              found = []
+              for j in range(idx, max(-1, idx - limit), -1):
+                  s = lines[j].strip()
+                  if j != idx and (s.endswith('}') or s.endswith(';')):
+                      break
+                  if ANN.search(lines[j]) and not s.startswith('//'):
+                      found.append(s)
+              return found
+
+          def body(lines, idx):
+              depth, started, out = 0, False, []
+              for j in range(idx, len(lines)):
+                  out.append(lines[j])
+                  depth += lines[j].count('{') - lines[j].count('}')
+                  if '{' in lines[j]:
+                      started = True
+                  if started and depth <= 0:
+                      break
+                  if not started and lines[j].strip().endswith(';'):
+                      break
+              return out
+
+          def assumptions(block):
+              out = []
+              for i, l in enumerate(block):
+                  if ASSUME.search(l):
+                      text, j = l.strip(), i
+                      while text.count('(') > text.count(')') and j + 1 < len(block) and j < i + 4:
+                          j += 1
+                          text += ' ' + block[j].strip()
+                      out.append(text)
+              return out
+
+          def class_idx(lines, simple):
+              pat = re.compile(r'\b(?:class|interface|object)\s+' + re.escape(simple) + r'\b')
+              for i, l in enumerate(lines):
+                  if pat.search(l):
+                      return i
+              return None
+
+          def super_of(path, lines, ci):
+              header = ' '.join(lines[ci:ci + 4])
+              m = re.search(r'\bextends\s+([\w.]+)', header) or re.search(r'\)\s*:\s*([\w.]+)\s*\(', header)
+              if not m:
+                  return None
+              sup = m.group(1)
+              if '.' in sup:
+                  return sup
+              for l in lines:
+                  im = re.match(r'\s*import\s+([\w.]+)\.' + re.escape(sup) + r'\s*;?\s*$', l)
+                  if im:
+                      return im.group(1) + '.' + sup
+              pk = next((re.match(r'\s*package\s+([\w.]+)', l).group(1) for l in lines if re.match(r'\s*package\s+[\w.]+', l)), '')
+              return (pk + '.' + sup) if pk else sup
+
+          def reasons(fqcn, method, depth=0):
+              path, simple = resolve(fqcn)
+              if not path or depth > 6:
+                  return []
+              lines = lines_of(path)
+              out = []
+              ci = class_idx(lines, simple)
+              if method:
+                  mpat = re.compile(r'\b(?:void|fun)\s+`?' + re.escape(method) + r'\s*`?\s*\(')
+                  for i, l in enumerate(lines):
+                      if mpat.search(l):
+                          out += annotations_above(lines, i)
+                          out += assumptions(body(lines, i))
+                          break
+              if ci is not None:
+                  out += ['class-level ' + a for a in annotations_above(lines, ci)]
+                  for i, l in enumerate(lines):
+                      if re.search(r'@(?:BeforeEach|BeforeAll|Before|BeforeClass)\b', l):
+                          for k in range(i, min(i + 4, len(lines))):
+                              if re.search(r'\b(?:void|fun)\s+\w+\s*\(', lines[k]):
+                                  out += ['setup ' + a for a in assumptions(body(lines, k))]
+                                  break
+                  sup = super_of(path, lines, ci)
+                  if sup and not out:
+                      out += reasons(sup, method, depth + 1)
+              return out
+
+          total, unexplained = 0, 0
+          for f in sorted(glob.glob('build/seal-skipped/*.tsv')):
+              for row in open(f, encoding='utf-8'):
+                  row = row.rstrip('\n')
+                  if not row:
+                      continue
+                  task, cls, name, msg = (row.split('\t') + ['', '', '', ''])[:4]
+                  total += 1
+                  if cls == 'UnknownClass':
+                      cls, name = name, ''
+                  # Gradle names: `m()`, `m(Type)[3]`, `m[ParamValue]`, or a Kotlin
+                  # backtick display name `some words (Type)[2]`.
+                  method = re.sub(r'\[[^\]]*\]$', '', name.strip())
+                  method = re.sub(r'\s*\([^()]*\)$', '', method).strip().strip('`').strip()
+                  rs = list(dict.fromkeys(reasons(cls, method)))
+                  if msg:
+                      rs.append('runtime: ' + msg)
+                  if not rs:
+                      unexplained += 1
+                      rs = ['no skip annotation/assumption found in source (JUnit reported the skip without a message)']
+                  print('SKIPPED TEST %s %s#%s -- reason: %s' % (task, cls, name, ' | '.join(rs)))
+          print('SKIPPED TEST REPORT: %d skipped, %d without a source-level reason' % (total, unexplained))
+          EOF
+          python3 -I "$RUNNER_TEMP/seal_skips.py"
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-webmvc-jar
+          path: |
+            spring-webmvc/build/libs/spring-webmvc-*.jar
+            !spring-webmvc/build/libs/*-sources.jar
+            !spring-webmvc/build/libs/*-javadoc.jar
+            !spring-webmvc/build/libs/*-test-fixtures.jar
+          if-no-files-found: error
+
+  test:
+    name: Test ${{ matrix.group }}
+    if: ${{ inputs.test-filter == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: core
+            tasks: ":spring-jcl:test :spring-core:test :spring-beans:test :spring-expression:test :spring-instrument:test :spring-context-indexer:test"
+          - group: context
+            tasks: ":spring-aop:test :spring-context:test :spring-context-support:test :spring-aspects:test"
+          - group: data
+            tasks: ":spring-tx:test :spring-jdbc:test :spring-orm:test :spring-oxm:test :spring-r2dbc:test"
+          - group: messaging
+            tasks: ":spring-jms:test :spring-messaging:test :spring-websocket:test"
+          - group: web
+            tasks: ":spring-web:test"
+          - group: webflux
+            tasks: ":spring-webflux:test"
+          - group: webmvc
+            tasks: ":spring-webmvc:test"
+          - group: test-and-integration
+            tasks: ":spring-test:test :integration-tests:test"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+      - name: Drop Gradle Enterprise plugins (ge.spring.io / repo.spring.io plugin repo unavailable to the fork)
+        run: |
+          sed -i -e '/id "com.gradle.enterprise"/d' -e '/id "io.spring.ge.conventions"/d' \
+                 -e '\#maven { url "https://repo.spring.io/release" }#d' settings.gradle
+          awk 'BEGIN{skip=0;depth=0}
+               /^settings\.gradle\.projectsLoaded/{skip=1}
+               { if (skip) { o=gsub(/\{/,"{"); c=gsub(/\}/,"}"); depth+=o-c; if (depth<=0 && (o+c)>0) skip=0; next } print }' \
+              settings.gradle > settings.gradle.seal && mv settings.gradle.seal settings.gradle
+          grep -q 'rootProject.children.each' settings.gradle
+          if grep -nE 'gradleEnterprise|com.gradle.enterprise|io.spring.ge.conventions' settings.gradle; then exit 1; fi
+      - name: Install test-result reporting init script
+        run: *init_script
+      - name: Test
+        run: ./gradlew $GRADLE_ARGS --continue ${{ matrix.tasks }}
+      - name: Report skipped tests
+        if: ${{ !cancelled() }}
+        run: *report_skips
