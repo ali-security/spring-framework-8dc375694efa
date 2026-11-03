@@ -16,6 +16,7 @@
 
 package org.springframework.util;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Locale;
@@ -807,6 +808,52 @@ class StringUtilsTests {
 	})
 	void truncate(String text, String truncated) {
 		assertThat(StringUtils.truncate(text, 10)).isEqualTo(truncated);
+	}
+
+	@Test
+	void uriDecode() {
+		assertThat(StringUtils.uriDecode("", StandardCharsets.UTF_8)).isEqualTo("");
+		assertThat(StringUtils.uriDecode("foobar", StandardCharsets.UTF_8)).isEqualTo("foobar");
+		assertThat(StringUtils.uriDecode("foo%20bar", StandardCharsets.UTF_8)).isEqualTo("foo bar");
+		assertThat(StringUtils.uriDecode("foo%2bbar", StandardCharsets.UTF_8)).isEqualTo("foo+bar");
+		assertThat(StringUtils.uriDecode("foo%2Bbar", StandardCharsets.UTF_8)).isEqualTo("foo+bar");
+		assertThat(StringUtils.uriDecode("T%C5%8Dky%C5%8D", StandardCharsets.UTF_8)).isEqualTo("T\u014dky\u014d");
+		assertThat(StringUtils.uriDecode("/Z%C3%BCrich", StandardCharsets.UTF_8)).isEqualTo("/Z\u00fcrich");
+		assertThat(StringUtils.uriDecode("T\u014dky\u014d", StandardCharsets.UTF_8)).isEqualTo("T\u014dky\u014d");
+		assertThat(StringUtils.uriDecode("%20\u2019", StandardCharsets.UTF_8)).isEqualTo(" \u2019");
+		assertThat(StringUtils.uriDecode("\u015bp\u0159\u00ec\u0144\u0121", StandardCharsets.UTF_8)).isEqualTo("\u015bp\u0159\u00ec\u0144\u0121");
+		assertThat(StringUtils.uriDecode("%20\u015bp\u0159\u00ec\u0144\u0121", StandardCharsets.UTF_8)).isEqualTo(" \u015bp\u0159\u00ec\u0144\u0121");
+	}
+
+	@Test
+	void uriDecodeKeepsCharactersAboveLatin1() {
+		// U+012E and U+012F have 0x2E ('.') and 0x2F ('/') as their low byte:
+		// truncating them would forge a "../" path traversal sequence
+		assertThat(StringUtils.uriDecode("\u012e\u012e\u012f%20", StandardCharsets.UTF_8))
+				.isEqualTo("\u012e\u012e\u012f ").doesNotContain("../");
+		assertThat(StringUtils.uriDecode("static/\u012e\u012e\u012f\u012e\u012e\u012fsecret%2etxt", StandardCharsets.UTF_8))
+				.isEqualTo("static/\u012e\u012e\u012f\u012e\u012e\u012fsecret.txt").doesNotContain("../");
+		assertThat(StringUtils.uriDecode("\u012e%2e/", StandardCharsets.UTF_8)).isEqualTo("\u012e./");
+	}
+
+	@Test
+	void uriDecodeRejectsNonAsciiHexDigits() {
+		// U+0662 (ARABIC-INDIC DIGIT TWO) and U+FF25 (FULLWIDTH LATIN CAPITAL LETTER E)
+		// are hexadecimal digits for Character#digit, which would decode them as "."
+		assertThatIllegalArgumentException().isThrownBy(() ->
+				StringUtils.uriDecode("%\u0662e%\u0662e/secret.txt", StandardCharsets.UTF_8));
+		assertThatIllegalArgumentException().isThrownBy(() ->
+				StringUtils.uriDecode("%2\uff25%2\uff25/secret.txt", StandardCharsets.UTF_8));
+	}
+
+	@Test
+	void uriDecodeInvalidSequence() {
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("foo%2", StandardCharsets.UTF_8));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("foo%", StandardCharsets.UTF_8));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("%", StandardCharsets.UTF_8));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("%zz", StandardCharsets.UTF_8));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("%20%", StandardCharsets.UTF_8));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("foo", null));
 	}
 
 }

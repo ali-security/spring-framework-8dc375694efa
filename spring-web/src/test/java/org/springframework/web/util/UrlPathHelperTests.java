@@ -111,6 +111,20 @@ class UrlPathHelperTests {
 	}
 
 	@Test
+	void getRequestUriWithCharactersAboveLatin1() {
+		// A non-compliant Servlet container may pass such characters through as-is:
+		// U+012E and U+012F must not be truncated into a "../" traversal sequence
+		request.setRequestURI("/static/ĮĮįsecret%2etxt");
+		assertThat(helper.getRequestUri(request))
+				.isEqualTo("/static/ĮĮįsecret.txt").doesNotContain("../");
+
+		request.setCharacterEncoding("UTF-8");
+		request.setRequestURI("/static/ĮĮįsecret%2etxt");
+		assertThat(helper.getLookupPathForRequest(request))
+				.isEqualTo("/static/ĮĮįsecret.txt").doesNotContain("../");
+	}
+
+	@Test
 	void getRequestRemoveSemicolonContent() {
 		helper.setRemoveSemicolonContent(true);
 		request.setRequestURI("/foo;f=F;o=O;o=O/bar;b=B;a=A;r=R");
